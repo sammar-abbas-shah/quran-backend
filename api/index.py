@@ -1,8 +1,9 @@
 import os
 import re
 import json
+import difflib
 import httpx
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from groq import Groq
@@ -11,7 +12,6 @@ from google.genai import types
 
 app = FastAPI(title="Quranic Chatbot Backend")
 
-# Allow requests from mobile emulators and local devices
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -23,13 +23,10 @@ app.add_middleware(
 ALQURAN_BASE_URL = "https://api.alquran.cloud/v1"
 
 # -----------------------------------------------------------------------------
-# AI Client Credentials
+# AI Client Credentials -- read ONLY from environment variables (set these in
+# Vercel: Project -> Settings -> Environment Variables). Never hardcode keys
+# here: this file is committed to a public/shared repo.
 # -----------------------------------------------------------------------------
-# IMPORTANT: your old keys were hardcoded here and were shared in a chat log.
-# Regenerate both keys in the Groq and Google AI Studio dashboards, then set
-# them as real environment variables (e.g. in a .env file loaded by your
-# process manager, or `export GROQ_API_KEY=...` before starting the server).
-# Do NOT put the actual key values back into this file.
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
@@ -41,20 +38,24 @@ if not GEMINI_API_KEY:
 groq_client = Groq(api_key=GROQ_API_KEY)
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
+# Groq deprecated llama-3.3-70b-versatile on 2026-08-16.
+GROQ_CHAT_MODEL = "openai/gpt-oss-120b"
+GEMINI_CHAT_MODEL = "gemini-3.6-flash"
+
 # -----------------------------------------------------------------------------
-# In-Memory Cache (RAM) to eliminate repeated fetches and network lag
+# In-Memory Cache (RAM)
 # -----------------------------------------------------------------------------
 surah_list_cache = None
 ayah_cache = {}
+quran_arabic_cache = None  # flat list for /recognize fuzzy matching
 
 
 # -----------------------------------------------------------------------------
-# 1. Quran Endpoints (Optimized with In-Memory Caching)
+# 1. Quran Endpoints
 # -----------------------------------------------------------------------------
 
 @app.get("/surahs")
 async def get_surahs():
-    """Returns the list of 114 Surahs instantly from RAM cache."""
     global surah_list_cache
     if surah_list_cache is not None:
         return surah_list_cache
@@ -80,7 +81,6 @@ async def get_surahs():
 
 @app.get("/surahs/{surah_id}/ayahs")
 async def get_ayahs(surah_id: int):
-    """Returns Arabic, English, and Urdu text cached after the first fetch."""
     if surah_id < 1 or surah_id > 114:
         raise HTTPException(status_code=400, detail="Invalid Surah ID")
 
@@ -116,7 +116,6 @@ async def get_ayahs(surah_id: int):
 
 @app.get("/search")
 async def search(q: str = Query(..., min_length=1)):
-    """Searches English translation by query."""
     url = f"{ALQURAN_BASE_URL}/search/{q}/all/en.sahih"
     async with httpx.AsyncClient(timeout=15.0) as client:
         resp = await client.get(url)
@@ -135,7 +134,7 @@ async def search(q: str = Query(..., min_length=1)):
 
 
 # -----------------------------------------------------------------------------
-# 2. Hybrid AI Chat (Groq Primary -> Gemini Fallback)
+# 2. AI Chat Endpoint
 # -----------------------------------------------------------------------------
 
 class ChatRequest(BaseModel):
@@ -149,7 +148,7 @@ You MUST reply strictly with compact JSON, all on one line, in this exact format
 {"text": "<2-3 sentence explanation in the requested language>", "citations": ["<surah>:<ayah>", ...]}
 Do not include markdown, code fences, or any text outside the JSON object."""
 
-FALLBACK_TEXT = {
+CHAT_FALLBACK = {
     "en": "I couldn't generate an answer right now. Please try again in a moment.",
     "ur": "اس وقت جواب نہیں بن سکا۔ براہ کرم تھوڑی دیر بعد دوبارہ کوشش کریں۔",
     "ar": "تعذر إنشاء إجابة الآن. حاول مرة أخرى بعد قليل.",
@@ -162,19 +161,15 @@ def _parse_json_reply(raw: str) -> dict | None:
     if not raw:
         return None
     raw = raw.strip()
-
     if raw.startswith("```"):
         raw = raw.strip("`")
         if "{" in raw:
             raw = raw[raw.find("{"):]
 
-    # 1. Straightforward case.
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
         pass
-
-    # 2. Response got cut off mid-string (too few max_tokens): try closing it.
     try:
         return json.loads(raw + '"}')
     except json.JSONDecodeError:
@@ -184,7 +179,6 @@ def _parse_json_reply(raw: str) -> dict | None:
     except json.JSONDecodeError:
         pass
 
-    # 3. Last resort: pull the text value and any "surah:ayah" refs out by hand.
     m = re.search(r'"text"\s*:\s*"((?:[^"\\]|\\.)*)', raw)
     if not m:
         return None
@@ -204,30 +198,26 @@ async def chat(req: ChatRequest):
     # 1. Primary: Groq
     try:
         response = groq_client.chat.completions.create(
-            model="openai/gpt-oss-120b",
+            model=GROQ_CHAT_MODEL,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": prompt_content},
             ],
             response_format={"type": "json_object"},
-            max_tokens=700,  # raised from 350 - too small caused truncated JSON
+            max_tokens=700,
             temperature=0.2,
         )
         parsed = _parse_json_reply(response.choices[0].message.content)
         if parsed and parsed.get("text"):
-            return {
-                "text": parsed["text"],
-                "citations": parsed.get("citations", []),
-            }
+            return {"text": parsed["text"], "citations": parsed.get("citations", [])}
         print("[GROQ ERROR] Could not parse a usable reply from Groq output")
-
     except Exception as groq_err:
         print(f"\n[GROQ ERROR]: {groq_err}\n")
 
     # 2. Fallback: Gemini
     try:
         response = gemini_client.models.generate_content(
-            model="gemini-3.6-flash",
+            model=GEMINI_CHAT_MODEL,
             contents=prompt_content,
             config=types.GenerateContentConfig(
                 system_instruction=SYSTEM_PROMPT,
@@ -237,18 +227,129 @@ async def chat(req: ChatRequest):
         )
         parsed = _parse_json_reply(response.text)
         if parsed and parsed.get("text"):
-            return {
-                "text": parsed["text"],
-                "citations": parsed.get("citations", []),
-            }
+            return {"text": parsed["text"], "citations": parsed.get("citations", [])}
         print("[GEMINI ERROR] Could not parse a usable reply from Gemini output")
-
     except Exception as gemini_err:
         print(f"\n[GEMINI ERROR]: {gemini_err}\n")
 
-    # 3. Both providers failed: the user always gets a normal sentence,
-    # never a raw exception/status string inside the chat bubble.
+    return {"text": CHAT_FALLBACK.get(req.language, CHAT_FALLBACK["en"]), "citations": []}
+
+
+# -----------------------------------------------------------------------------
+# 3. Audio: Speech-to-Text & Verse Recitation Recognition
+# -----------------------------------------------------------------------------
+
+@app.post("/stt")
+async def speech_to_text(file: UploadFile = File(...)):
+    """Transcribes user voice input into text using Groq Whisper."""
+    try:
+        audio_bytes = await file.read()
+        transcription = groq_client.audio.transcriptions.create(
+            file=(file.filename or "audio.m4a", audio_bytes),
+            model="whisper-large-v3",
+            response_format="json",
+        )
+        return {"text": transcription.text.strip()}
+    except Exception as e:
+        print(f"\n[STT ERROR]: {e}\n")
+        raise HTTPException(status_code=500, detail="speech_to_text_failed")
+
+
+_DIACRITICS = re.compile(
+    "[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06ED\u0640]"
+)
+
+
+def _normalize_arabic(text: str) -> str:
+    """Diacritic-free, letter-unified Arabic used for verse matching. Also
+    drops spaces, since Whisper's word-splitting rarely matches the
+    Uthmani script's spacing exactly."""
+    text = _DIACRITICS.sub("", text)
+    for a, b in (("ٱ", "ا"), ("أ", "ا"), ("إ", "ا"), ("آ", "ا"),
+                 ("ؤ", "و"), ("ئ", "ي"), ("ء", ""), ("ى", "ي"), ("ة", "ه")):
+        text = text.replace(a, b)
+    return re.sub(r"\s+", "", text)
+
+
+async def _get_quran_arabic_flat():
+    """Loads the whole Quran's Arabic text once (cached across warm serverless
+    invocations, same pattern as surah_list_cache), for fuzzy-matching
+    recitations against REAL verse text -- never guessed by an LLM."""
+    global quran_arabic_cache
+    if quran_arabic_cache is not None:
+        return quran_arabic_cache
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.get(f"{ALQURAN_BASE_URL}/quran/quran-uthmani")
+        if resp.status_code != 200:
+            raise HTTPException(status_code=502, detail="Failed to load Quran text")
+        surahs = resp.json().get("data", {}).get("surahs", [])
+
+    flat = []
+    for s in surahs:
+        for a in s.get("ayahs", []):
+            flat.append({
+                "surah": s["number"],
+                "ayah": a["numberInSurah"],
+                "text": a["text"],
+                "text_norm": _normalize_arabic(a["text"]),
+            })
+    if len(flat) < 6000:  # sanity check: the Quran has 6236 ayahs
+        raise HTTPException(status_code=502, detail="Incomplete Quran text loaded")
+    quran_arabic_cache = flat
+    return flat
+
+
+@app.post("/recognize")
+async def recognize_recitation(file: UploadFile = File(...)):
+    """Transcribes recited Quranic audio, then matches it against the REAL
+    Quran text using string similarity -- not an LLM guess, so the surah,
+    ayah, and confidence returned are never hallucinated."""
+    try:
+        audio_bytes = await file.read()
+        transcription = groq_client.audio.transcriptions.create(
+            file=(file.filename or "audio.m4a", audio_bytes),
+            model="whisper-large-v3",
+            language="ar",
+            response_format="json",
+        )
+        transcript = transcription.text.strip()
+    except Exception as e:
+        print(f"\n[RECOGNIZE STT ERROR]: {e}\n")
+        raise HTTPException(status_code=500, detail="speech_to_text_failed")
+
+    if not transcript:
+        raise HTTPException(status_code=400, detail="no_speech")
+
+    query_norm = _normalize_arabic(transcript)
+    if len(query_norm) < 3:
+        raise HTTPException(status_code=400, detail="no_speech")
+
+    try:
+        verses = await _get_quran_arabic_flat()
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"\n[RECOGNIZE INDEX ERROR]: {e}\n")
+        raise HTTPException(status_code=503, detail="index_unavailable")
+
+    best = None
+    best_score = 0.0
+    for v in verses:
+        score = difflib.SequenceMatcher(None, query_norm, v["text_norm"]).ratio()
+        if score > best_score:
+            best_score = score
+            best = v
+
+    if best is None or best_score < 0.45:
+        raise HTTPException(status_code=404, detail="no_match")
+
     return {
-        "text": FALLBACK_TEXT.get(req.language, FALLBACK_TEXT["en"]),
-        "citations": [],
+        "transcript": transcript,
+        "confidence": round(best_score, 3),  # real similarity, never guessed
+        "ayah": {
+            "surah_id": best["surah"],
+            "ayah_number": best["ayah"],
+            "arabic": best["text"],
+        },
     }
