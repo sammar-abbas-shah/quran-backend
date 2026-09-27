@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import asyncio
 import difflib
 import httpx
 from fastapi import FastAPI, HTTPException, Query, UploadFile, File
@@ -47,6 +48,7 @@ GEMINI_CHAT_MODEL = "gemini-3.6-flash"
 # -----------------------------------------------------------------------------
 surah_list_cache = None
 ayah_cache = {}
+juz_cache = {}
 quran_arabic_cache = None  # flat list for /recognize fuzzy matching
 
 
@@ -112,6 +114,55 @@ async def get_ayahs(surah_id: int):
 
         ayah_cache[surah_id] = out
         return out
+
+
+@app.get("/juz/{juz_id}")
+async def get_juz(juz_id: int):
+    """Every ayah of a Juz/Para (1-30), across whichever Surahs it spans.
+
+    alquran.cloud documents multi-edition fetches for /surah and /ayah but
+    not for /juz, so instead of gambling on an undocumented URL shape this
+    fetches each edition's Juz separately (three requests) and zips them by
+    position -- the same three ayahs, in the same order, come back from
+    each edition every time.
+    """
+    if juz_id < 1 or juz_id > 30:
+        raise HTTPException(status_code=400, detail="Invalid Juz number")
+
+    if juz_id in juz_cache:
+        return juz_cache[juz_id]
+
+    async def fetch_edition(client: httpx.AsyncClient, edition: str):
+        resp = await client.get(f"{ALQURAN_BASE_URL}/juz/{juz_id}/{edition}")
+        if resp.status_code != 200:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Failed to load Juz {juz_id} ({edition})",
+            )
+        return resp.json().get("data", {}).get("ayahs", [])
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        ar_ayahs, en_ayahs, ur_ayahs = await asyncio.gather(
+            fetch_edition(client, "quran-uthmani"),
+            fetch_edition(client, "en.sahih"),
+            fetch_edition(client, "ur.jalandhry"),
+        )
+
+    out = []
+    for i in range(len(ar_ayahs)):
+        surah_no = ar_ayahs[i].get("surah", {}).get("number")
+        ayah_no = ar_ayahs[i]["numberInSurah"]
+        out.append({
+            "surah_id": surah_no,
+            "ayah_number": ayah_no,
+            "arabic": ar_ayahs[i]["text"],
+            "english": en_ayahs[i]["text"] if i < len(en_ayahs) else "",
+            "urdu": ur_ayahs[i]["text"] if i < len(ur_ayahs) else "",
+            "audio_url": f"https://everyayah.com/data/Alafasy_128kbps/{str(surah_no).zfill(3)}{str(ayah_no).zfill(3)}.mp3",
+        })
+
+    juz_cache[juz_id] = out
+    return out
 
 
 @app.get("/search")
