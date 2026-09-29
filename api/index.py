@@ -395,6 +395,22 @@ async def recognize_recitation(file: UploadFile = File(...)):
     if best is None or best_score < 0.45:
         raise HTTPException(status_code=404, detail="no_match")
 
+    # Attach the English + Urdu translations (and audio) of the matched verse.
+    # get_ayahs() is cached per Surah, so repeat lookups are instant. If the
+    # translation source is down, still return the Arabic match rather than
+    # failing the whole recognition.
+    english, urdu, audio_url = "", "", None
+    try:
+        surah_ayahs = await get_ayahs(best["surah"])
+        for a in surah_ayahs:
+            if a["ayah_number"] == best["ayah"]:
+                english = a.get("english", "")
+                urdu = a.get("urdu", "")
+                audio_url = a.get("audio_url")
+                break
+    except Exception as e:
+        print(f"\n[RECOGNIZE TRANSLATION ERROR]: {e}\n")
+
     return {
         "transcript": transcript,
         "confidence": round(best_score, 3),  # real similarity, never guessed
@@ -402,5 +418,8 @@ async def recognize_recitation(file: UploadFile = File(...)):
             "surah_id": best["surah"],
             "ayah_number": best["ayah"],
             "arabic": best["text"],
+            "english": english,
+            "urdu": urdu,
+            "audio_url": audio_url,
         },
     }
